@@ -11,15 +11,103 @@ from docx import Document
 import sys
 
 
-def extract_abbreviations(docx_path):
+# Normalize typographical variants for matching; retain the author's display spelling.
+_DASHES = str.maketrans({c: "-" for c in "‐‑‒–—−"})
+_PARENTHESES = re.compile(r"[（(]([^()（）]+)[)）]")
+_ABBREVIATION = re.compile(r"[A-Za-z0-9]+(?:[-/+&.][A-Za-z0-9]+)*")
+_ENGLISH_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9\s\-/&+.'’]*")
+# Explicit prose boundaries, rather than deleting individual Chinese characters.
+_CONTEXT = re.compile(
+    r"以及|也就是|也称为|称为|简称|记为|分别对应|对应|也包括|包括|"
+    r"提出了一种|提出一种|提出了|提出|设计了|设计|构建了|构建|"
+    r"本文采用|采用|通过控制|通过|利用|引入|借助|基于|结合|扩展|强化|"
+    r"封装至|替换为|随着|也称|即为|中如|导致|加大了|由多层"
+)
+
+
+def _clean_space(text):
+    return " ".join(text.split())
+
+
+def _is_abbreviation(text, include_single_letter):
+    normalized = text.translate(_DASHES)
+    letters = re.sub(r"[^A-Za-z]", "", normalized)
+    return bool(
+        _ABBREVIATION.fullmatch(normalized)
+        and any(c.isupper() for c in letters)
+        and (len(letters) >= 2 or (include_single_letter and len(letters) == 1))
+    )
+
+
+def _parse_definition(body, include_single_letter):
+    parts = re.split(r"[,，;；]", body)
+    if len(parts) != 2:
+        return None
+    left, right = map(_clean_space, parts)
+    for full, abbr in ((left, right), (right, left)):
+        normalized = full.translate(_DASHES)
+        if not _is_abbreviation(abbr, include_single_letter):
+            continue
+        if not _ENGLISH_NAME.fullmatch(normalized) or not re.search(r"[A-Za-z]", full):
+            continue
+        # Reject two acronym-like tokens, numbers and bibliographic citations.
+        if _is_abbreviation(full, False):
+            if not re.search(r"[a-z]{2}", full):
+                continue
+        if len(re.sub(r"[^A-Za-z]", "", full)) <= len(re.sub(r"[^A-Za-z]", "", abbr)):
+            continue
+        return abbr, full
+    return None
+
+
+def _chinese_name(prefix):
+    # Stop at sentence boundaries, earlier definitions, citations and line breaks.
+    candidate = re.split(r"[，,。；;：:！？!?、()（）\[\]【】\n\r]", prefix)[-1].strip()
+    candidate = _CONTEXT.split(candidate)[-1].strip()
+    candidate = re.sub(r"^(?:并以|与|或|及|的|一种|一个)+", "", candidate).strip()
+    # A conjunction following an English token marks another candidate (IoU或旋转IoU).
+    candidate = re.split(r"(?<=[A-Za-z0-9])或", candidate)[-1].strip()
+    if not re.search(r"[\u3400-\u9fff]", candidate):
+        return ""
+    return _clean_space(candidate)
+
+
+def extract_from_text(text, include_single_letter=False):
+    """Extract (abbreviation, English full name, Chinese name) definitions in order.
+
+    Single-letter symbols such as Q/K/V are excluded unless explicitly enabled.
+    Chinese names are conservative heuristics and may need manual review.
     """
-    从Word文档中提取缩略词
+    results = []
+    for match in _PARENTHESES.finditer(text):
+        definition = _parse_definition(match.group(1), include_single_letter)
+        if definition is None:
+            continue
+        chinese = _chinese_name(text[:match.start()])
+        if chinese:
+            results.append((*definition, chinese))
+    return results
 
-    Args:
-        docx_path: Word文档路径
 
-    Returns:
-        list: 包含(中文, 英文全称, 英文缩写)的元组列表
+def _paragraph_texts(doc):
+    # XML document order includes nested tables without visiting merged cells twice.
+    from docx.oxml.ns import qn
+
+    for paragraph in doc.element.body.iter(qn("w:p")):
+        pieces = []
+        for node in paragraph.iter():
+            if node.tag == qn("w:t"):
+                pieces.append(node.text or "")
+            elif node.tag in (qn("w:tab"), qn("w:br"), qn("w:cr")):
+                pieces.append("\n" if node.tag != qn("w:tab") else "\t")
+        yield "".join(pieces)
+
+
+def extract_abbreviations(docx_path, include_single_letter=False):
+    """Return unique (abbreviation, English full name, Chinese name) tuples.
+
+    Full names differing only in case, whitespace or dash style are deduplicated.
+    Abbreviation case is significant; different full names remain separate.
     """
     try:
         doc = Document(docx_path)
@@ -28,69 +116,14 @@ def extract_abbreviations(docx_path):
         print(f"详细信息：{e}")
         return []
 
-    # 多个正则表达式匹配模式，覆盖不同格式
-    patterns = [
-        # 模式1: 中文（英文全称, 英文缩写）
-        r'([\u4e00-\u9fa5]+)\s*[（(]\s*([A-Za-z\s\-]+)\s*[,，]\s*([A-Z][A-Za-z0-9]*)\s*[)）]',
-        # 模式2: 英文+中文（英文全称, 英文缩写） - 如"旋转IoU（Rotated IoU, RIoU）"
-        r'(?:[\u4e00-\u9fa5]*[A-Za-z]+[\u4e00-\u9fa5]*)\s*[（(]\s*([A-Za-z\s\-]+)\s*[,，]\s*([A-Z][A-Za-z0-9]*)\s*[)）]',
-        # 模式3: 纯中文后跟括号 - 更宽松的匹配
-        r'([\u4e00-\u9fa5]{2,})\s*[（(]\s*([A-Za-z][\w\s\-]*[A-Za-z])\s*[,，]\s*([A-Z][A-Za-z0-9]+)\s*[)）]',
-    ]
-
     abbreviations = []
-    seen = set()  # 用于去重
-
-    def process_text(text):
-        """处理文本，提取缩略词"""
-        for pattern in patterns:
-            matches = re.finditer(pattern, text)
-            for match in matches:
-                groups = match.groups()
-
-                # 根据匹配的组数确定提取方式
-                if len(groups) == 3:
-                    chinese = groups[0].strip() if groups[0] else ""
-                    english_full = groups[1].strip()
-                    english_abbr = groups[2].strip()
-                elif len(groups) == 2:
-                    # 模式2的情况，需要从原文提取中文部分
-                    english_full = groups[0].strip()
-                    english_abbr = groups[1].strip()
-                    # 提取括号前的中文部分，扩大搜索范围并改进匹配
-                    start = match.start()
-                    prefix = text[max(0, start-50):start]
-                    # 匹配更完整的中文短语（包含标点符号前的内容）
-                    chinese_match = re.search(r'([^\n\r。；，、！？]+[\u4e00-\u9fa5A-Za-z0-9]+)\s*$', prefix)
-                    if chinese_match:
-                        chinese = chinese_match.group(1).strip()
-                        # 清理开头的标点和连接词
-                        chinese = re.sub(r'^[的、，。；：\s]+', '', chinese)
-                    else:
-                        chinese = ""
-                else:
-                    continue
-
-                # 清理和验证
-                if not english_abbr or len(english_abbr) < 2:
-                    continue
-
-                # 去重（基于缩写和英文全称，允许同一缩写有不同中文描述）
-                key = (english_abbr, english_full)
-                if key not in seen:
-                    seen.add(key)
-                    abbreviations.append((english_abbr, english_full, chinese))
-
-    # 遍历所有段落
-    for para in doc.paragraphs:
-        process_text(para.text)
-
-    # 同时检查表格中的内容
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                process_text(cell.text)
-
+    seen = set()
+    for text in _paragraph_texts(doc):
+        for abbr, full, chinese in extract_from_text(text, include_single_letter):
+            key = (abbr.translate(_DASHES), full.translate(_DASHES).casefold())
+            if key not in seen:
+                seen.add(key)
+                abbreviations.append((abbr, full, chinese))
     return abbreviations
 
 
